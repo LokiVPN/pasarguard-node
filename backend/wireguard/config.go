@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
-	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -18,9 +18,6 @@ type Config struct {
 	PreSharedKey  string   `json:"pre_shared_key,omitempty"`
 	ListenPort    int      `json:"listen_port"`
 	Address       []string `json:"address"`
-
-	// Peer keepalive configuration
-	PeerKeepaliveSeconds int `json:"peer_keepalive_seconds"`
 
 	privateKeyValue   wgtypes.Key
 	privateKeySet     bool
@@ -66,12 +63,28 @@ func NewConfig(config string) (*Config, error) {
 		wgConfig.ListenPort = 51820
 	}
 
-	// Set default peer keepalive
-	if wgConfig.PeerKeepaliveSeconds <= 0 {
-		wgConfig.PeerKeepaliveSeconds = 25
-	}
-
 	return &wgConfig, nil
+}
+
+// InterfaceNetworks returns CIDR prefixes parsed from the node's core `address` list.
+// Used to restrict peer AllowedIPs to subnets this interface actually serves.
+func (c *Config) InterfaceNetworks() []*net.IPNet {
+	if c == nil {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, addr := range c.Address {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(addr)
+		if err != nil {
+			continue
+		}
+		out = append(out, ipNet)
+	}
+	return out
 }
 
 // GetPrivateKey returns the parsed WireGuard private key.
@@ -135,12 +148,6 @@ func (c *Config) GetPreSharedKey() (*wgtypes.Key, error) {
 	c.presharedKeyValue = &key
 	c.presharedKeySet = true
 	return &key, nil
-}
-
-// GetKeepalive returns the configured peer keepalive interval as a time.Duration.
-// Int reads are atomic on all supported platforms, so no lock is needed.
-func (c *Config) GetKeepalive() time.Duration {
-	return time.Duration(c.PeerKeepaliveSeconds) * time.Second
 }
 
 // GenerateKeyPair generates a new WireGuard key pair

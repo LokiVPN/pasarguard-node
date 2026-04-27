@@ -12,11 +12,16 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func buildAddConfig(publicKey wgtypes.Key, allowedIPs []net.IPNet, keepalive time.Duration, presharedKey *wgtypes.Key) wgtypes.PeerConfig {
+var (
+	tempKeepAlive = time.Duration(0)
+	keepAlive     = &tempKeepAlive
+)
+
+func buildAddConfig(publicKey wgtypes.Key, allowedIPs []net.IPNet, presharedKey *wgtypes.Key) wgtypes.PeerConfig {
 	config := wgtypes.PeerConfig{
 		PublicKey:                   publicKey,
 		AllowedIPs:                  allowedIPs,
-		PersistentKeepaliveInterval: &keepalive,
+		PersistentKeepaliveInterval: keepAlive,
 	}
 	if presharedKey != nil {
 		config.PresharedKey = presharedKey
@@ -46,7 +51,6 @@ type SyncDiff struct {
 func (wg *WireGuard) buildSyncDiff(
 	existingPeers map[string]*PeerInfo,
 	desiredPeers map[string]*DesiredPeer,
-	keepalive time.Duration,
 ) (*SyncDiff, error) {
 	targetPeers := make(map[string]*PeerInfo, len(desiredPeers))
 	for key, desired := range desiredPeers {
@@ -82,7 +86,7 @@ func (wg *WireGuard) buildSyncDiff(
 
 		if existing.Email != target.Email || !ipnetsEqual {
 			if !ipnetsEqual {
-				config, err := buildAddConfigFromPeerInfo(target, keepalive, psk)
+				config, err := buildAddConfigFromPeerInfo(target, psk)
 				if err != nil {
 					log.Printf("quarantining peer update %s due to config error: %v", target.Email, err)
 					continue
@@ -96,7 +100,7 @@ func (wg *WireGuard) buildSyncDiff(
 
 	for key, target := range targetPeers {
 		if _, exists := existingPeers[key]; !exists {
-			config, err := buildAddConfigFromPeerInfo(target, keepalive, psk)
+			config, err := buildAddConfigFromPeerInfo(target, psk)
 			if err != nil {
 				log.Printf("quarantining peer %s due to config error: %v", target.Email, err)
 				continue
@@ -137,7 +141,7 @@ func (wg *WireGuard) buildSyncDiff(
 // Returns the config slice AND the set of public keys that were successfully
 // built, so callers can filter the peerStore upsert list accordingly — the
 // store must only contain peers that were actually committed to the kernel.
-func buildTargetPeerConfigs(targetPeers map[string]*PeerInfo, keepalive time.Duration, presharedKey *wgtypes.Key) ([]wgtypes.PeerConfig, map[string]struct{}) {
+func buildTargetPeerConfigs(targetPeers map[string]*PeerInfo, presharedKey *wgtypes.Key) ([]wgtypes.PeerConfig, map[string]struct{}) {
 	keys := make([]string, 0, len(targetPeers))
 	for key := range targetPeers {
 		keys = append(keys, key)
@@ -147,7 +151,7 @@ func buildTargetPeerConfigs(targetPeers map[string]*PeerInfo, keepalive time.Dur
 	configs := make([]wgtypes.PeerConfig, 0, len(keys))
 	appliedKeys := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
-		config, err := buildAddConfigFromPeerInfo(targetPeers[key], keepalive, presharedKey)
+		config, err := buildAddConfigFromPeerInfo(targetPeers[key], presharedKey)
 		if err != nil {
 			log.Printf("quarantining startup peer %s due to config error: %v", targetPeers[key].Email, err)
 			continue
@@ -175,12 +179,35 @@ func filterUpsertsByAppliedKeys(upserts []*PeerInfo, appliedKeys map[string]stru
 	return filtered
 }
 
-func buildAddConfigFromPeerInfo(peer *PeerInfo, keepalive time.Duration, presharedKey *wgtypes.Key) (wgtypes.PeerConfig, error) {
+func buildAddConfigFromPeerInfo(peer *PeerInfo, presharedKey *wgtypes.Key) (wgtypes.PeerConfig, error) {
 	if len(peer.AllowedIPs) == 0 {
 		return wgtypes.PeerConfig{}, fmt.Errorf("peer %s has no allowed IPs", peer.Email)
 	}
 
-	return buildAddConfig(peer.PublicKey, peer.AllowedIPs, keepalive, presharedKey), nil
+	return buildAddConfig(peer.PublicKey, peer.AllowedIPs, presharedKey), nil
+}
+
+func peerIPAllowedOnInterface(peerNet *net.IPNet, ifaceNets []*net.IPNet) bool {
+	if len(ifaceNets) == 0 {
+		return true
+	}
+	for _, pool := range ifaceNets {
+		if pool == nil || peerNet == nil {
+			continue
+		}
+		if len(peerNet.IP) != len(pool.IP) {
+			continue
+		}
+		if !pool.Contains(peerNet.IP) {
+			continue
+		}
+		pPeer, _ := peerNet.Mask.Size()
+		pPool, _ := pool.Mask.Size()
+		if pPeer >= pPool {
+			return true
+		}
+	}
+	return false
 }
 
 func (wg *WireGuard) collectDesiredPeers(users []*common.User) (map[string]*DesiredPeer, error) {
@@ -202,6 +229,8 @@ func (wg *WireGuard) collectDesiredPeers(users []*common.User) (map[string]*Desi
 			continue
 		}
 
+		ifaceNets := wg.config.InterfaceNetworks()
+
 		var allowedIPNets []net.IPNet
 		var hasInvalidIP bool
 
@@ -211,6 +240,16 @@ func (wg *WireGuard) collectDesiredPeers(users []*common.User) (map[string]*Desi
 				log.Printf("quarantining user %s due to invalid provided IP %s: %v", email, peerIp, err)
 				hasInvalidIP = true
 				break
+			}
+
+			if !peerIPAllowedOnInterface(ipNet, ifaceNets) {
+				log.Printf(
+					"skipping wireguard peer IP %s for user %s on interface %s (outside core address ranges)",
+					peerIp,
+					email,
+					wg.config.InterfaceName,
+				)
+				continue
 			}
 
 			canonicalIP := ipNet.String()

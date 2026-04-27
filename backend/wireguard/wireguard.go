@@ -163,12 +163,13 @@ func newWithManagerFactory(cfg *config.Config, wgConfig *Config, users []*common
 		return nil, fmt.Errorf("failed to collect desired peers: %w", err)
 	}
 
-	startupDiff, err := wg.buildSyncDiff(startupExistingByKey, startupDesiredPeers, wg.config.GetKeepalive())
+	startupDiff, err := wg.buildSyncDiff(startupExistingByKey, startupDesiredPeers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build sync diff: %w", err)
 	}
 	psk, _ := wgConfig.GetPreSharedKey()
-	startupPeerConfigs, appliedKeys := buildTargetPeerConfigs(startupDiff.TargetPeers, wgConfig.GetKeepalive(), psk)
+	startupPeerConfigs, appliedKeys := buildTargetPeerConfigs(startupDiff.TargetPeers, psk)
+
 
 	manager, err := wg.newManager(wgConfig.InterfaceName)
 	if err != nil {
@@ -180,6 +181,9 @@ func newWithManagerFactory(cfg *config.Config, wgConfig *Config, users []*common
 		manager.Close()
 		return nil, fmt.Errorf("failed to initialize interface: %w", err)
 	}
+
+	// After the tunnel exists, apply sysctl + nft so iifname matches the real interface name from core config.
+	applyLinuxHostRouting(wgConfig.InterfaceName)
 
 	wg.manager = manager
 
@@ -195,7 +199,7 @@ func newWithManagerFactory(cfg *config.Config, wgConfig *Config, users []*common
 	wg.mu.Unlock()
 
 	log.Println("wireguard started, Version:", wg.Version())
-	wg.logChan <- fmt.Sprintf("WireGuard interface %s initialized successfully", wgConfig.InterfaceName)
+	wg.emitInfoLogf("WireGuard interface %s initialized successfully", wgConfig.InterfaceName)
 
 	return wg, nil
 }
@@ -229,6 +233,10 @@ func (wg *WireGuard) Restart() error {
 	wg.syncMu.Lock()
 	defer wg.syncMu.Unlock()
 
+	return wg.restartLocked()
+}
+
+func (wg *WireGuard) restartLocked() error {
 	wg.mu.RLock()
 	cfg := wg.config
 	if cfg == nil {
@@ -243,12 +251,11 @@ func (wg *WireGuard) Restart() error {
 	}
 
 	listenPort := cfg.ListenPort
-	keepalive := cfg.GetKeepalive()
 	allPeers := wg.peerStore.GetAll()
 	wg.mu.RUnlock()
 
 	psk, _ := wg.config.GetPreSharedKey()
-	peerConfigs, err := buildPeerConfigsForRestart(allPeers, keepalive, psk)
+	peerConfigs, err := buildPeerConfigsForRestart(allPeers, psk)
 	if err != nil {
 		return fmt.Errorf("failed to build restart peer configs: %w", err)
 	}
@@ -262,6 +269,7 @@ func (wg *WireGuard) Restart() error {
 	wg.mu.Unlock()
 
 	log.Println("dynamically reconfiguring wireguard interface")
+	wg.emitInfoLogf("dynamically reconfiguring wireguard interface")
 
 	config := wgtypes.Config{
 		PrivateKey:   &privateKey,
@@ -275,6 +283,7 @@ func (wg *WireGuard) Restart() error {
 	}
 
 	log.Println("wireguard interface reconfigured successfully without downtime")
+	wg.emitInfoLogf("wireguard interface reconfigured successfully without downtime")
 	return nil
 }
 
@@ -289,7 +298,7 @@ func (wg *WireGuard) Shutdown() {
 	})
 }
 
-func buildPeerConfigsForRestart(peers []*PeerInfo, keepalive time.Duration, presharedKey *wgtypes.Key) ([]wgtypes.PeerConfig, error) {
+func buildPeerConfigsForRestart(peers []*PeerInfo, presharedKey *wgtypes.Key) ([]wgtypes.PeerConfig, error) {
 	orderedPeers := append([]*PeerInfo(nil), peers...)
 	sort.Slice(orderedPeers, func(i, j int) bool {
 		return orderedPeers[i].PublicKey.String() < orderedPeers[j].PublicKey.String()
@@ -301,7 +310,7 @@ func buildPeerConfigsForRestart(peers []*PeerInfo, keepalive time.Duration, pres
 			return nil, fmt.Errorf("peer %s has no allowed IPs", peer.Email)
 		}
 
-		peerConfigs = append(peerConfigs, buildAddConfig(peer.PublicKey, peer.AllowedIPs, keepalive, presharedKey))
+		peerConfigs = append(peerConfigs, buildAddConfig(peer.PublicKey, peer.AllowedIPs, presharedKey))
 	}
 
 	return peerConfigs, nil
@@ -323,12 +332,14 @@ func (wg *WireGuard) shutdownLocked() {
 	if wg.manager != nil {
 		if err := wg.manager.Close(); err != nil {
 			log.Printf("error closing manager: %v", err)
+			wg.emitLogLocked(logSeverityError, fmt.Sprintf("error closing manager: %v", err))
 		}
 		wg.manager = nil
 	}
 
 	wg.state = lifecycleStopped
 	wg.version = ""
+	wg.emitLogLocked(logSeverityInfo, "wireguard shutdown complete")
 	if wg.logChan != nil {
 		close(wg.logChan)
 		wg.logChan = nil

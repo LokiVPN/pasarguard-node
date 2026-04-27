@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -160,6 +161,16 @@ func TestWireGuardNewInitializesWithSingleConfigureCallIncludingPeers(t *testing
 		t.Fatalf("expected one peer in startup configure call, got %d", len(configured.Peers))
 	}
 
+	select {
+	case startupLog := <-wg.Logs():
+		pattern := regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d{6} \[Info\] WireGuard interface wg-test initialized successfully$`)
+		if !pattern.MatchString(startupLog) {
+			t.Fatalf("expected startup log with timestamp prefix, got %q", startupLog)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected startup log to be emitted")
+	}
+
 	parsedPublicKey, err := wgtypes.ParseKey(publicKey)
 	if err != nil {
 		t.Fatalf("failed to parse public key: %v", err)
@@ -216,7 +227,7 @@ func TestBuildPeerConfigsForRestartRejectsPeersWithoutValidAllowedIPs(t *testing
 		mustPeerInfo("invalid@example.com", invalidKey, []string{"not-a-cidr"}),
 	}
 
-	if _, err := buildPeerConfigsForRestart(peers, 25*time.Second, nil); err == nil {
+	if _, err := buildPeerConfigsForRestart(peers, nil); err == nil {
 		t.Fatal("expected error for peer with invalid allowed IP")
 	}
 }
@@ -235,7 +246,7 @@ func TestBuildPeerConfigsForRestartOrdersPeersDeterministically(t *testing.T) {
 		mustPeerInfo("b@example.com", keyB, []string{"10.78.0.4/32"}),
 	}
 
-	cfgs, err := buildPeerConfigsForRestart(peers, 25*time.Second, nil)
+	cfgs, err := buildPeerConfigsForRestart(peers, nil)
 	if err != nil {
 		t.Fatalf("buildPeerConfigsForRestart failed: %v", err)
 	}

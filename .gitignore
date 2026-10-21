@@ -9,7 +9,7 @@
 *.dylib
 # Test binary, built with `go test -c`
 *.test
-.gocache
+.gocache*
 .gotemp
 
 # Output of the go coverage tool, specifically when used with LiteIDE
@@ -29,3 +29,9 @@ xray-core/
 
 # AI
 .AI
+graphify-out
+superpowers/
+
+certs/
+generated/
+pasarguard-node*

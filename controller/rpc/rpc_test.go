@@ -19,7 +19,7 @@ import (
 	"github.com/pasarguard/node/common"
 	"github.com/pasarguard/node/config"
 	"github.com/pasarguard/node/controller"
-	"github.com/pasarguard/node/tools"
+	"github.com/pasarguard/node/pkg/tlsutil"
 )
 
 var (
@@ -48,7 +48,7 @@ func TestMain(m *testing.M) {
 	// Setup
 	cfg := config.NewTestConfig(generatedConfigPath, apiKey)
 
-	tlsConfig, err := tools.LoadTLSCredentials(sslCertFile, sslKeyFile)
+	tlsConfig, err := tlsutil.LoadTLSCredentials(sslCertFile, sslKeyFile)
 	if err != nil {
 		log.Fatalf("Failed to load TLS credentials: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start gRPC listener: %v", err)
 	}
 
-	certPool, err := tools.LoadClientPool(sslCertFile)
+	certPool, err := tlsutil.LoadClientPool(sslCertFile)
 	if err != nil {
 		log.Fatalf("Failed to load client pool: %v", err)
 	}
@@ -415,6 +415,7 @@ func TestGRPC_GetSystemStats(t *testing.T) {
 	log.Println("cpu_cores:", nodeStats.GetCpuCores())
 	log.Println("incoming_bandwidth:", nodeStats.GetIncomingBandwidthSpeed())
 	log.Println("outgoing_bandwidth:", nodeStats.GetOutgoingBandwidthSpeed())
+	log.Println("uptime:", nodeStats.GetUptime())
 }
 
 func TestGRPC_KeepAliveTimeout(t *testing.T) {

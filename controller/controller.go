@@ -14,10 +14,11 @@ import (
 	"github.com/pasarguard/node/backend/xray"
 	"github.com/pasarguard/node/common"
 	"github.com/pasarguard/node/config"
-	"github.com/pasarguard/node/tools"
+	"github.com/pasarguard/node/pkg/netutil"
+	"github.com/pasarguard/node/pkg/sysstats"
 )
 
-const NodeVersion = "0.3.1"
+const NodeVersion = "0.5.4"
 
 type Service interface {
 	Disconnect()
@@ -27,18 +28,20 @@ type Controller struct {
 	backend     backend.Backend
 	cfg         *config.Config
 	apiPort     int
-	clientIP    string
+	metricPort  int
 	lastRequest time.Time
 	stats       *common.SystemStatsResponse
 	cancelFunc  context.CancelFunc
 	mu          sync.RWMutex
+	controlMu   sync.Mutex
 }
 
 func New(cfg *config.Config) *Controller {
 	_, cancel := context.WithCancel(context.Background())
 	return &Controller{
 		cfg:        cfg,
-		apiPort:    tools.FindFreePort(),
+		apiPort:    netutil.FindFreePort(),
+		metricPort: netutil.FindFreePort(),
 		cancelFunc: cancel,
 	}
 }
@@ -49,12 +52,14 @@ func (c *Controller) ApiKey() uuid.UUID {
 	return c.cfg.ApiKey
 }
 
-func (c *Controller) Connect(ip string, keepAlive uint64) {
+func (c *Controller) Connect(keepAlive uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lastRequest = time.Now()
-	c.clientIP = ip
 
+	if c.cancelFunc != nil {
+		c.cancelFunc()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancelFunc = cancel
 	go c.recordSystemStats(ctx)
@@ -80,14 +85,16 @@ func (c *Controller) Disconnect() {
 	defer c.mu.Unlock()
 
 	c.backend = nil
-	c.apiPort = tools.FindFreePort()
-	c.clientIP = ""
+	c.apiPort = netutil.FindFreePort()
+	c.metricPort = netutil.FindFreePort()
 }
 
-func (c *Controller) Ip() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.clientIP
+func (c *Controller) LockControl() {
+	c.controlMu.Lock()
+}
+
+func (c *Controller) UnlockControl() {
+	c.controlMu.Unlock()
 }
 
 func (c *Controller) NewRequest() {
@@ -107,7 +114,14 @@ func (c *Controller) StartBackend(ctx context.Context, backend *common.Backend) 
 			return err
 		}
 
-		newBackend, err := xray.New(ctx, config, backend.GetUsers(), c.apiPort, c.cfg)
+		newBackend, err := xray.New(
+			ctx,
+			config,
+			backend.GetUsers(),
+			c.apiPort,
+			c.metricPort,
+			c.cfg,
+		)
 		if err != nil {
 			return err
 		}
@@ -157,27 +171,70 @@ func (c *Controller) keepAliveTracker(ctx context.Context, keepAlive time.Durati
 }
 
 func (c *Controller) recordSystemStats(ctx context.Context) {
+	interval := 1500 * time.Millisecond
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	collect := func() {
+		stats, err := sysstats.GetSystemStats(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Failed to get system stats: %v", err)
+			return
+		}
+
+		c.mu.Lock()
+		c.stats = stats
+		c.mu.Unlock()
+	}
+
+	collect()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			stats, err := tools.GetSystemStats()
-			if err != nil {
-				log.Printf("Failed to get system stats: %v", err)
-			} else {
-				c.mu.Lock()
-				c.stats = stats
-				c.mu.Unlock()
-			}
+		case <-ticker.C:
+			collect()
 		}
 	}
 }
 
-func (c *Controller) SystemStats() *common.SystemStatsResponse {
+func (c *Controller) SystemStats(ctx context.Context) *common.SystemStatsResponse {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.stats
+	statsSnapshot := c.stats
+	backendSnapshot := c.backend
+	c.mu.RUnlock()
+
+	response := &common.SystemStatsResponse{}
+	if statsSnapshot != nil {
+		response = &common.SystemStatsResponse{
+			MemTotal:               statsSnapshot.GetMemTotal(),
+			MemUsed:                statsSnapshot.GetMemUsed(),
+			CpuCores:               statsSnapshot.GetCpuCores(),
+			CpuUsage:               statsSnapshot.GetCpuUsage(),
+			IncomingBandwidthSpeed: statsSnapshot.GetIncomingBandwidthSpeed(),
+			OutgoingBandwidthSpeed: statsSnapshot.GetOutgoingBandwidthSpeed(),
+			Uptime:                 statsSnapshot.GetUptime(),
+		}
+	}
+
+	if backendSnapshot == nil {
+		return response
+	}
+
+	// Backend uptime is owned by each backend implementation; controller only forwards it here.
+	backendStats, err := backendSnapshot.GetSysStats(ctx)
+	if err != nil {
+		log.Printf("Failed to get backend uptime for system stats: %v", err)
+		return response
+	}
+
+	response.Uptime = uint64(backendStats.GetUptime())
+	return response
 }
 
 func (c *Controller) BaseInfoResponse() *common.BaseInfoResponse {
@@ -196,4 +253,16 @@ func (c *Controller) BaseInfoResponse() *common.BaseInfoResponse {
 	}
 
 	return response
+}
+
+func (c *Controller) OutboundsLatency(ctx context.Context, request *common.LatencyRequest) (*common.LatencyResponse, error) {
+	c.mu.RLock()
+	backendSnapshot := c.backend
+	c.mu.RUnlock()
+
+	if backendSnapshot == nil {
+		return &common.LatencyResponse{Latencies: []*common.Latency{}}, nil
+	}
+
+	return backendSnapshot.GetOutboundsLatency(ctx, request)
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,16 +26,21 @@ type Core struct {
 	process                   *exec.Cmd
 	processPID                int
 	restarting                bool
+	stopping                  bool
+	waitDone                  chan struct{}
 	logsChan                  chan string
 	logPhase                  uint32
 	startupLogs               *startupLogRing
 	startupLogSize            int
 	startupFailure            string
 	startupDiagnosticsEnabled bool
+	runtimeLogs               *startupLogRing
+	unixSocketPaths           []string
 	logger                    *nodeLogger.Logger
 	cancelFunc                context.CancelFunc
 	mu                        sync.Mutex
 	startupMu                 sync.RWMutex
+	runtimeMu                 sync.RWMutex
 }
 
 func NewXRayCore(executablePath, assetsPath, configPath string, logBufferSize, startupLogTailSize int) (*Core, error) {
@@ -49,6 +55,7 @@ func NewXRayCore(executablePath, assetsPath, configPath string, logBufferSize, s
 		logsChan:       make(chan string, logBufferSize),
 		logPhase:       logPhaseRuntime,
 		startupLogSize: startupLogTailSize,
+		runtimeLogs:    newStartupLogRing(10),
 	}
 
 	version, err := core.refreshVersion()
@@ -116,6 +123,66 @@ func (c *Core) Started() bool {
 	return false
 }
 
+func (c *Core) Stopping() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopping
+}
+
+func collectUnixSocketPaths(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	paths := make([]string, 0)
+
+	for _, inbound := range cfg.InboundConfigs {
+		if inbound == nil {
+			continue
+		}
+
+		listen := strings.TrimSpace(inbound.Listen)
+		if listen == "" {
+			continue
+		}
+
+		path, _, _ := strings.Cut(listen, ",")
+		path = strings.TrimSpace(path)
+		if !strings.HasPrefix(path, "/") {
+			continue
+		}
+
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+
+	return paths
+}
+
+func removeUnixSocketFiles(paths []string) {
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("warning: failed to stat unix socket %s: %v", path, err)
+			}
+			continue
+		}
+
+		if info.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: failed to remove unix socket %s: %v", path, err)
+		}
+	}
+}
+
 func (c *Core) Start(xConfig *Config, debugMode bool) error {
 	accessFile, errorFile := xConfig.GetLogFiles()
 
@@ -134,6 +201,10 @@ func (c *Core) Start(xConfig *Config, debugMode bool) error {
 		return errors.New("xray is started already")
 	}
 
+	c.runtimeMu.Lock()
+	c.runtimeLogs.reset()
+	c.runtimeMu.Unlock()
+
 	c.EnableStartupDiagnostics(c.startupLogSize)
 	c.setStartupLogPhase()
 
@@ -150,6 +221,9 @@ func (c *Core) Start(xConfig *Config, debugMode bool) error {
 		c.process = nil
 		c.processPID = 0
 	}
+
+	socketPaths := collectUnixSocketPaths(xConfig)
+	removeUnixSocketFiles(socketPaths)
 
 	cmd := exec.Command(c.executablePath, "-c", "stdin:")
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+c.assetsPath)
@@ -173,10 +247,16 @@ func (c *Core) Start(xConfig *Config, debugMode bool) error {
 	}
 	c.process = cmd
 	c.processPID = cmd.Process.Pid
+	c.stopping = false
+	c.waitDone = make(chan struct{})
+	c.unixSocketPaths = socketPaths
 
 	// Wait for the process to exit to prevent zombie processes
+	waitDone := c.waitDone
 	go func() {
-		_ = cmd.Wait()
+		waitErr := cmd.Wait()
+		close(waitDone)
+		c.handleProcessExit(cmd, waitErr)
 	}()
 
 	ctxCore, cancel := context.WithCancel(context.Background())
@@ -188,29 +268,48 @@ func (c *Core) Start(xConfig *Config, debugMode bool) error {
 	return nil
 }
 
+func (c *Core) handleProcessExit(cmd *exec.Cmd, err error) {
+	c.mu.Lock()
+	expected := c.stopping || c.process != cmd
+	c.mu.Unlock()
+
+	if expected {
+		return
+	}
+
+	message := "xray process exited unexpectedly"
+	if err != nil {
+		message = fmt.Sprintf("%s: %v", message, err)
+		if strings.Contains(strings.ToLower(err.Error()), "signal: killed") {
+			message += " (process was killed externally; check container/system OOM and memory limits)"
+		}
+	}
+
+	log.Println(message)
+	c.recordProcessLog(message)
+}
+
 func (c *Core) Stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.Started() {
+	started := c.Started()
+	if !started && c.process == nil && c.cancelFunc == nil && c.logger == nil && len(c.unixSocketPaths) == 0 {
 		return
 	}
 
-	if c.process != nil && c.process.Process != nil {
+	if started {
 		pid := c.process.Process.Pid
 		c.processPID = pid
+		waitDone := c.waitDone
+		c.stopping = true
 
 		// Kill the process
 		_ = c.process.Process.Kill()
 
-		// Wait for process to terminate with timeout
-		done := make(chan error, 1)
-		go func() {
-			done <- c.process.Wait()
-		}()
-
+		// Wait for the process watcher to reap the process.
 		select {
-		case <-done:
+		case <-waitDone:
 			// Process terminated
 		case <-time.After(5 * time.Second):
 			// Timeout - try force kill
@@ -225,11 +324,17 @@ func (c *Core) Stop() {
 			_ = killProcessTree(pid)
 		}
 	}
+	socketPaths := append([]string(nil), c.unixSocketPaths...)
 	c.process = nil
 	c.processPID = 0
+	c.stopping = false
+	c.waitDone = nil
+	c.unixSocketPaths = nil
+	removeUnixSocketFiles(socketPaths)
 
 	if c.cancelFunc != nil {
 		c.cancelFunc()
+		c.cancelFunc = nil
 	}
 
 	if c.logger != nil {
@@ -262,6 +367,12 @@ func (c *Core) Restart(config *Config, debugMode bool) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Core) Restarting() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.restarting
 }
 
 func (c *Core) Logs() <-chan string {

@@ -67,13 +67,31 @@ func (s *Service) GetUserOnlineIpListStats(w http.ResponseWriter, r *http.Reques
 func (s *Service) GetBackendStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.Backend().GetSysStats(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		st, _ := status.FromError(err)
+		httpCode := common.GrpcCodeToHTTP(st.Code())
+		http.Error(w, err.Error(), httpCode)
 		return
 	}
 
 	common.SendProtoResponse(w, stats)
 }
 
-func (s *Service) GetSystemStats(w http.ResponseWriter, _ *http.Request) {
-	common.SendProtoResponse(w, s.SystemStats())
+func (s *Service) GetOutboundsLatency(w http.ResponseWriter, r *http.Request) {
+	var request common.LatencyRequest
+	if err := common.ReadProtoBody(r.Body, &request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	latency, err := s.OutboundsLatency(r.Context(), &request)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	common.SendProtoResponse(w, latency)
+}
+
+func (s *Service) GetSystemStats(w http.ResponseWriter, r *http.Request) {
+	common.SendProtoResponse(w, s.SystemStats(r.Context()))
 }

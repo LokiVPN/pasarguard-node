@@ -64,6 +64,7 @@ type WireGuard struct {
 	syncMu         sync.Mutex
 	lastStatsErrAt time.Time
 	newManager     newManagerFunc
+	hostRouting    func()
 }
 
 // getWireGuardVersion fetches the wireguard-tools version
@@ -170,7 +171,6 @@ func newWithManagerFactory(cfg *config.Config, wgConfig *Config, users []*common
 	psk, _ := wgConfig.GetPreSharedKey()
 	startupPeerConfigs, appliedKeys := buildTargetPeerConfigs(startupDiff.TargetPeers, psk)
 
-
 	manager, err := wg.newManager(wgConfig.InterfaceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create manager: %w", err)
@@ -182,8 +182,8 @@ func newWithManagerFactory(cfg *config.Config, wgConfig *Config, users []*common
 		return nil, fmt.Errorf("failed to initialize interface: %w", err)
 	}
 
-	// After the tunnel exists, apply sysctl + nft so iifname matches the real interface name from core config.
-	applyLinuxHostRouting(wgConfig.InterfaceName)
+	// After the tunnel exists, apply optional host routing so nft iifname matches the real interface.
+	wg.hostRouting = applyLinuxHostRouting(cfg, wgConfig.InterfaceName)
 
 	wg.manager = manager
 
@@ -327,6 +327,11 @@ func (wg *WireGuard) shutdownLocked() {
 	}
 	if wg.cleanupTicker != nil {
 		wg.cleanupTicker.Stop()
+	}
+
+	if wg.hostRouting != nil {
+		wg.hostRouting()
+		wg.hostRouting = nil
 	}
 
 	if wg.manager != nil {

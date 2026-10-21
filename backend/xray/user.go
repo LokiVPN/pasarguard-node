@@ -3,9 +3,11 @@ package xray
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/pasarguard/node/backend/xray/api"
 	"github.com/pasarguard/node/common"
@@ -41,45 +43,28 @@ func setupUserAccount(user *common.User) (api.ProxySettings, error) {
 	return settings, nil
 }
 
-func checkVless(inbound *Inbound, account api.VlessAccount) api.VlessAccount {
-	if account.Flow != "" {
-
-		networkType, ok := inbound.StreamSettings["network"]
-		if !ok || !(networkType == "tcp" || networkType == "raw" || networkType == "kcp") {
-			account.Flow = ""
-			return account
-		}
-
-		securityType, ok := inbound.StreamSettings["security"]
-		if !ok || !(securityType == "tls" || securityType == "reality") {
-			account.Flow = ""
-			return account
-		}
-
-		rawMap, ok := inbound.StreamSettings["rawSettings"].(map[string]interface{})
-		if !ok {
-			rawMap, ok = inbound.StreamSettings["tcpSettings"].(map[string]interface{})
-			if !ok {
-				return account
-			}
-		}
-
-		headerMap, ok := rawMap["header"].(map[string]interface{})
-		if !ok {
-			return account
-		}
-
-		headerType, ok := headerMap["Type"].(string)
-		if !ok {
-			return account
-		}
-
-		if headerType == "http" {
-			account.Flow = ""
-			return account
-		}
+func inboundFlow(inbound *Inbound) string {
+	if inbound == nil || inbound.Settings == nil {
+		return ""
 	}
-	return account
+	flow, _ := inbound.Settings["flow"].(string)
+	return flow
+}
+
+func accountForAPI(inbound *Inbound, account api.Account) api.Account {
+	vlessAccount, ok := account.(*api.VlessAccount)
+	if !ok {
+		return account
+	}
+
+	overrideFlow := inboundFlow(inbound)
+	if overrideFlow == "" {
+		return account
+	}
+
+	copy := *vlessAccount
+	copy.Flow = overrideFlow
+	return &copy
 }
 
 func checkShadowsocks2022(method string, account api.ShadowsocksAccount) api.ShadowsocksAccount {
@@ -95,8 +80,7 @@ func isActiveInbound(inbound *Inbound, inbounds []string, settings api.ProxySett
 			if settings.Vless == nil {
 				return nil, false
 			}
-			account := checkVless(inbound, *settings.Vless)
-			return &account, true
+			return settings.Vless, true
 
 		case Vmess:
 			if settings.Vmess == nil {
@@ -136,6 +120,9 @@ func isActiveInbound(inbound *Inbound, inbounds []string, settings api.ProxySett
 }
 
 func (x *Xray) SyncUser(ctx context.Context, user *common.User) error {
+	x.syncMu.Lock()
+	defer x.syncMu.Unlock()
+
 	proxySetting, err := setupUserAccount(user)
 	if err != nil {
 		return err
@@ -144,7 +131,7 @@ func (x *Xray) SyncUser(ctx context.Context, user *common.User) error {
 	handler := x.handler
 	inbounds := x.config.InboundConfigs
 
-	var errMessage string
+	var errMessage strings.Builder
 
 	userInbounds := user.GetInbounds()
 
@@ -157,37 +144,83 @@ func (x *Xray) SyncUser(ctx context.Context, user *common.User) error {
 		account, isActive := isActiveInbound(inbound, userInbounds, proxySetting)
 		if isActive {
 			inbound.updateUser(account)
-			err = handler.AddInboundUser(ctx, inbound.Tag, account)
+			err = handler.AddInboundUser(ctx, inbound.Tag, accountForAPI(inbound, account))
 			if err != nil {
 				log.Println(err)
-				errMessage += "\n" + err.Error()
+				errMessage.WriteString("\n" + err.Error())
 			}
 		} else {
 			inbound.removeUser(user.GetEmail())
 		}
 	}
 
-	if errMessage != "" {
-		return errors.New("failed to add user:" + errMessage)
+	if errMessage.String() != "" {
+		return errors.New("failed to add user:" + errMessage.String())
 	}
 	return nil
 }
 
 func (x *Xray) SyncUsers(ctx context.Context, users []*common.User) error {
-	x.config.syncUsers(users)
-	if err := x.Restart(); err != nil {
+	x.syncMu.Lock()
+	defer x.syncMu.Unlock()
+
+	candidate, err := x.config.Clone()
+	if err != nil {
 		return err
 	}
+
+	candidate.syncUsers(users)
+	return x.applyConfigWithRestart(ctx, candidate)
+}
+
+func (x *Xray) applyConfigWithRestart(ctx context.Context, candidate *Config) error {
+	previous := x.config
+
+	if err := x.restartCoreWithConfig(candidate); err != nil {
+		if restoreErr := x.restorePreviousConfig(previous); restoreErr != nil {
+			return fmt.Errorf("%w; failed to restore previous xray config: %v", err, restoreErr)
+		}
+		return err
+	}
+
+	if err := x.checkXrayStatus(ctx); err != nil {
+		if restoreErr := x.restorePreviousConfig(previous); restoreErr != nil {
+			return fmt.Errorf("%w; failed to restore previous xray config: %v", err, restoreErr)
+		}
+		return err
+	}
+
+	x.setConfig(candidate)
+	return nil
+}
+
+func (x *Xray) restorePreviousConfig(previous *Config) error {
+	if previous == nil {
+		return errors.New("previous xray config is nil")
+	}
+
+	log.Println("restoring previous xray config after failed restart")
+	if err := x.restartCoreWithConfig(previous); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	if err := x.checkXrayStatus(ctx); err != nil {
 		return err
 	}
+
+	x.setConfig(previous)
 	return nil
 }
 
 func (x *Xray) UpdateUsers(ctx context.Context, users []*common.User) error {
+	x.syncMu.Lock()
+	defer x.syncMu.Unlock()
+
 	handler := x.handler
 	inboundByTag, updates := x.config.buildInboundUpdates(users)
-	var errMessage string
+	var errMessage strings.Builder
 
 	for tag, update := range updates {
 		removeEmails := make([]string, 0, len(update.removeEmailSet))
@@ -204,27 +237,29 @@ func (x *Xray) UpdateUsers(ctx context.Context, users []*common.User) error {
 
 		for _, account := range update.accounts {
 			_ = handler.RemoveInboundUser(ctx, tag, account.GetEmail())
-			if err := handler.AddInboundUser(ctx, tag, account); err != nil {
+			if err := handler.AddInboundUser(ctx, tag, accountForAPI(inbound, account)); err != nil {
 				log.Println(err)
-				errMessage += "\n" + err.Error()
+				errMessage.WriteString("\n" + err.Error())
 			}
 		}
 	}
 
-	if errMessage != "" {
-		return errors.New("failed to update users:" + errMessage)
+	if errMessage.String() != "" {
+		return errors.New("failed to update users:" + errMessage.String())
 	}
 
 	return nil
 }
 
 func (x *Xray) UpdateUsersAndRestart(ctx context.Context, users []*common.User) error {
-	x.config.updateUsers(users)
-	if err := x.Restart(); err != nil {
+	x.syncMu.Lock()
+	defer x.syncMu.Unlock()
+
+	candidate, err := x.config.Clone()
+	if err != nil {
 		return err
 	}
-	if err := x.checkXrayStatus(ctx); err != nil {
-		return err
-	}
-	return nil
+
+	candidate.updateUsers(users)
+	return x.applyConfigWithRestart(ctx, candidate)
 }

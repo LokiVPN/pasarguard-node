@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -151,8 +152,7 @@ func (i *Inbound) syncUsers(users []*common.User) {
 					log.Println("error for user", user.GetEmail(), ":", err)
 					continue
 				}
-				newAccount := checkVless(i, *account)
-				i.clients[user.GetEmail()] = &newAccount
+				i.clients[user.GetEmail()] = account
 			}
 		}
 
@@ -216,8 +216,7 @@ func (i *Inbound) updateUser(account api.Account) {
 		i.clients[email] = a
 
 	case *api.VlessAccount:
-		newAccount := checkVless(i, *a)
-		i.clients[email] = &newAccount
+		i.clients[email] = a
 
 	case *api.TrojanAccount:
 		i.clients[email] = a
@@ -258,8 +257,7 @@ func (i *Inbound) updateUsers(accounts []api.Account, removeEmails []string) {
 	case Vless:
 		for _, account := range accounts {
 			if a, ok := account.(*api.VlessAccount); ok {
-				newAccount := checkVless(i, *a)
-				i.clients[account.GetEmail()] = &newAccount
+				i.clients[account.GetEmail()] = a
 			}
 		}
 
@@ -430,6 +428,9 @@ func filterRules(rules []json.RawMessage, apiTag string) ([]json.RawMessage, err
 		if outboundTagValue, ok := obj["outboundTag"].(string); ok && outboundTagValue == apiTag {
 			continue
 		}
+		if ruleTagValue, ok := obj["ruleTag"].(string); ok && ruleTagValue == malformedDomainGuardRuleTag {
+			continue
+		}
 
 		filtered = append(filtered, raw)
 	}
@@ -526,6 +527,93 @@ func normalizeGeoIPPrivateRules(rules []json.RawMessage) ([]json.RawMessage, err
 	return normalized, nil
 }
 
+// canonicalAPIServices maps a lowercased service name to its canonical form.
+// ponytail: mirrors the switch in xray-core infra/conf/api.go APIConfig.Build().
+// Ceiling: this set must be synced by hand against xray-core on upgrade —
+// nothing detects drift automatically. TestSanitizeAPIServices pins the
+// expected names, so a hand-edit to this map breaks the test and forces the
+// expectations to be updated deliberately.
+var canonicalAPIServices = map[string]string{
+	"reflectionservice":  "ReflectionService",
+	"handlerservice":     "HandlerService",
+	"loggerservice":      "LoggerService",
+	"statsservice":       "StatsService",
+	"observatoryservice": "ObservatoryService",
+	"routingservice":     "RoutingService",
+}
+
+// requiredAPIServices are always present — the node's own gRPC clients depend on
+// HandlerService (users/inbounds) and StatsService (traffic); LoggerService
+// preserves current behavior.
+var requiredAPIServices = []string{"HandlerService", "LoggerService", "StatsService"}
+
+// sanitizeAPIServices returns the required API services plus any valid
+// user-provided extras (canonicalized, deduped case-insensitively, sorted).
+// Unknown service names are dropped with a logged warning rather than failing
+// the backend, matching the rest of ApplyAPI's defensive normalization.
+func sanitizeAPIServices(userProvided []string) []string {
+	seen := make(map[string]struct{}, len(requiredAPIServices)+len(userProvided))
+	result := make([]string, 0, len(requiredAPIServices)+len(userProvided))
+
+	for _, s := range requiredAPIServices {
+		key := strings.ToLower(s)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, s)
+	}
+
+	extras := make([]string, 0, len(userProvided))
+	for _, s := range userProvided {
+		key := strings.ToLower(strings.TrimSpace(s))
+		if key == "" {
+			continue
+		}
+		canonical, ok := canonicalAPIServices[key]
+		if !ok {
+			log.Printf("xray config: dropping unknown API service %q", s)
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		extras = append(extras, canonical)
+	}
+
+	sort.Strings(extras)
+	return append(result, extras...)
+}
+
+const (
+	defaultObservatoryProbeURL      = "https://www.google.com/generate_204"
+	defaultObservatoryProbeInterval = "10s"
+)
+
+// defaultObservatory builds an observatory app that probes every eligible
+// outbound (a tag whose protocol is not in observatoryExcludedProtocols). It is
+// injected only when ObservatoryService is enabled but the operator configured
+// no observatory/burstObservatory — without the observatory feature xray-core
+// fails dependency resolution and the core exits. With no eligible outbounds it
+// still returns a valid object so the dependency resolves.
+func (c *Config) defaultObservatory() map[string]any {
+	protocolByTag := c.outboundProtocolByTag()
+	tags := make([]string, 0, len(protocolByTag))
+	for tag, protocol := range protocolByTag {
+		if _, excluded := observatoryExcludedProtocols[protocol]; excluded {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return map[string]any{
+		"subjectSelector": tags,
+		"probeURL":        defaultObservatoryProbeURL,
+		"probeInterval":   defaultObservatoryProbeInterval,
+	}
+}
+
 func apiRuleSources() []string {
 	seen := map[string]struct{}{
 		"127.0.0.1": {},
@@ -575,7 +663,125 @@ func apiRuleSources() []string {
 	return sources
 }
 
-func (c *Config) ApplyAPI(apiPort int) (err error) {
+func loopbackListenAddress(port int) string {
+	addr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port))
+	return addr.String()
+}
+
+func (c *Config) outboundProtocolByTag() map[string]string {
+	rawOutbounds, ok := c.OutboundConfigs.([]any)
+	if !ok {
+		return nil
+	}
+
+	out := make(map[string]string, len(rawOutbounds))
+	for _, outbound := range rawOutbounds {
+		obj, ok := outbound.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag, _ := obj["tag"].(string)
+		protocol, _ := obj["protocol"].(string)
+		tag = strings.TrimSpace(tag)
+		protocol = strings.TrimSpace(protocol)
+		if tag == "" || protocol == "" {
+			continue
+		}
+		out[tag] = protocol
+	}
+
+	return out
+}
+
+const malformedDomainGuardRuleTag = "PG_NODE_MALFORMED_DOMAIN_GUARD"
+
+func (c *Config) blackholeOutboundTag() string {
+	protocolByTag := c.outboundProtocolByTag()
+	if len(protocolByTag) == 0 {
+		return ""
+	}
+
+	tags := make([]string, 0, len(protocolByTag))
+	for tag := range protocolByTag {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	for _, tag := range tags {
+		if strings.EqualFold(protocolByTag[tag], "blackhole") {
+			return tag
+		}
+	}
+
+	return ""
+}
+
+func malformedDomainGuardRule(outboundTag string) (json.RawMessage, error) {
+	rule := map[string]any{
+		"domain": []string{
+			"regexp:^.{254,}$",
+			"regexp:(^|\\.)[^.]{64,}(\\.|$)",
+		},
+		"outboundTag": outboundTag,
+		"ruleTag":     malformedDomainGuardRuleTag,
+		"type":        "field",
+	}
+
+	rawBytes, err := json.Marshal(rule)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.RawMessage(rawBytes), nil
+}
+
+var observatoryExcludedProtocols = map[string]struct{}{
+	"blackhole": {},
+	"dns":       {},
+	"loopback":  {},
+}
+
+func (c *Config) sanitizeObservatorySelectors() {
+	protocolByTag := c.outboundProtocolByTag()
+	if len(protocolByTag) == 0 {
+		return
+	}
+
+	sanitize := func(section map[string]any) {
+		if section == nil {
+			return
+		}
+		raw, ok := section["subjectSelector"]
+		if !ok {
+			return
+		}
+		values, ok := raw.([]any)
+		if !ok {
+			return
+		}
+
+		filtered := make([]any, 0, len(values))
+		for _, value := range values {
+			tag, ok := value.(string)
+			if !ok {
+				continue
+			}
+			protocol, hasProtocol := protocolByTag[strings.TrimSpace(tag)]
+			if hasProtocol {
+				if _, excluded := observatoryExcludedProtocols[protocol]; excluded {
+					continue
+				}
+			}
+			filtered = append(filtered, tag)
+		}
+		section["subjectSelector"] = filtered
+	}
+
+	sanitize(c.Observatory)
+	sanitize(c.BurstObservatory)
+}
+
+func (c *Config) ApplyAPI(apiPort, metricPort int) (err error) {
 	// Remove the existing inbound with the API_INBOUND tag
 	for i, inbound := range c.InboundConfigs {
 		if inbound.Tag == "API_INBOUND" {
@@ -585,10 +791,33 @@ func (c *Config) ApplyAPI(apiPort int) (err error) {
 
 	apiTag := "API"
 
-	c.API = &conf.APIConfig{
-		Services: []string{"HandlerService", "LoggerService", "StatsService"},
-		Tag:      apiTag,
+	var userServices []string
+	if c.API != nil {
+		userServices = c.API.Services
 	}
+
+	services := sanitizeAPIServices(userServices)
+	c.API = &conf.APIConfig{
+		Services: services,
+		Tag:      apiTag,
+		// Listen intentionally left empty: the node exposes the API only via the
+		// loopback, source-restricted API_INBOUND below. Honoring a user listen
+		// would open a second, unguarded gRPC entry point.
+	}
+
+	// ObservatoryService has a hard dependency on the observatory feature; enabling
+	// it without an observatory/burstObservatory app makes xray exit on startup.
+	// Inject a functional default so the toggle is crash-free and immediately useful.
+	if slices.Contains(services, "ObservatoryService") &&
+		c.Observatory == nil && c.BurstObservatory == nil {
+		c.Observatory = c.defaultObservatory()
+	}
+
+	c.Metrics = map[string]any{
+		"tag":    "metric",
+		"listen": loopbackListenAddress(metricPort),
+	}
+	c.sanitizeObservatorySelectors()
 
 	if c.RouterConfig == nil {
 		c.RouterConfig = &conf.RouterConfig{}
@@ -631,7 +860,16 @@ func (c *Config) ApplyAPI(apiPort int) (err error) {
 
 	newRaw := json.RawMessage(rawBytes)
 
-	c.RouterConfig.RuleList = append([]json.RawMessage{newRaw}, c.RouterConfig.RuleList...)
+	prependRules := []json.RawMessage{newRaw}
+	if blockTag := c.blackholeOutboundTag(); blockTag != "" {
+		guardRaw, err := malformedDomainGuardRule(blockTag)
+		if err != nil {
+			return err
+		}
+		prependRules = append(prependRules, guardRaw)
+	}
+
+	c.RouterConfig.RuleList = append(prependRules, c.RouterConfig.RuleList...)
 
 	return nil
 }

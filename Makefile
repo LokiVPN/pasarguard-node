@@ -2,7 +2,7 @@ NAME = pasarguard-node-$(GOOS)-$(GOARCH)
 
 LDFLAGS = -s -w -buildid=
 PARAMS = -trimpath -ldflags "$(LDFLAGS)" -v
-MAIN = ./main.go
+MAIN = ./cmd/node
 PREFIX ?= $(shell go env GOPATH)
 XRAY_OS ?=
 XRAY_ARCH ?=
@@ -65,17 +65,23 @@ SAN ?= DNS:localhost,IP:127.0.0.1
 
 generate_server_cert:
 	mkdir -p ./certs
-	openssl req -x509 -newkey rsa:4096 -keyout ./certs/ssl_key.pem \
-	-out ./certs/ssl_cert.pem -days 36500 -nodes \
-	-subj "/CN=$(CN)" \
-	-addext "subjectAltName = $(SAN)"
+	openssl req -x509 -newkey ec \
+		-pkeyopt ec_paramgen_curve:P-256 \
+		-keyout ./certs/ssl_key.pem \
+		-out ./certs/ssl_cert.pem \
+		-days 3650 -nodes \
+		-subj "/CN=$(CN)" \
+		-addext "subjectAltName = $(SAN)"
 
 generate_client_cert:
 	mkdir -p ./certs
-	openssl req -x509 -newkey rsa:4096 -keyout ./certs/ssl_client_key.pem \
- 	-out ./certs/ssl_client_cert.pem -days 36500 -nodes \
-	-subj "/CN=$(CN)" \
-	-addext "subjectAltName = $(SAN)"
+	openssl req -x509 -newkey ec \
+		-pkeyopt ec_paramgen_curve:P-256 \
+		-keyout ./certs/ssl_client_key.pem \
+		-out ./certs/ssl_client_cert.pem \
+		-days 3650 -nodes \
+		-subj "/CN=$(CN)" \
+		-addext "subjectAltName = $(SAN)"
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -172,4 +178,4 @@ test-race-wireguard:
 	GOTOOLCHAIN=auto CGO_ENABLED=1 go test -race -v -p 1 ./backend/wireguard
 
 serve:
-	go run main.go serve
+	go run ./cmd/node
